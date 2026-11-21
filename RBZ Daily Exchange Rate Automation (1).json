@@ -1,0 +1,248 @@
+{
+  "name": "RBZ Daily Exchange Rate Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "a01d6a06-e66d-4eb4-a445-39d39033b377",
+      "name": "Daily Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1184,
+        400
+      ],
+      "notes": "Runs weekdays at 10:00. RBZ typically publishes rates in the morning; adjust the hour once you've observed actual publish times. Weekends/holidays are skipped by the cron itself, but RBZ also skips public holidays, which this schedule does not account for — handled instead by the 'no PDF today' branch below."
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\n\nconst monthNamesUpper = ['JANUARY','FEBRUARY','MARCH','APRIL','MAY','JUNE','JULY','AUGUST','SEPTEMBER','OCTOBER','NOVEMBER','DECEMBER'];\nconst monthNamesTitle = ['January','February','March','April','May','June','July','August','September','October','November','December'];\n\nconst day = now.getDate();\nconst year = now.getFullYear();\nconst monthIndex = now.getMonth();\nconst monthUpper = monthNamesUpper[monthIndex];\nconst monthTitle = monthNamesTitle[monthIndex];\n\nconst directPdfUrl = `https://www.rbz.co.zw/documents/Exchange_Rates/${year}/${monthTitle}/RATES_${day}_${monthUpper}_${year}.pdf`;\n// Month archive page slug — the numeric prefix (e.g. 1644-) changes per month/year on the live site.\n// This is a best-effort guess; confirm the current slug by visiting the exchange rates page\n// and update the pattern below, or replace with a lookup step if RBZ changes their URL scheme.\n\nreturn [{\n  json: {\n    day,\n    year,\n    monthUpper,\n    monthTitle,\n    directPdfUrl,\n    todayLabel: `${day} ${monthTitle} ${year}`\n  }\n}];"
+      },
+      "id": "ee85f779-adf6-4edd-92e1-ad95ad770263",
+      "name": "Build Date Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -960,
+        400
+      ],
+      "notes": "Builds today's expected PDF URL and the month archive page URL as a fallback."
+    },
+    {
+      "parameters": {
+        "url": "={{$json.directPdfUrl}}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "0445b745-0cce-42a1-ba69-9ab3fc5a9221",
+      "name": "Try Direct PDF URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -736,
+        400
+      ],
+      "notes": "neverError:true so a 404 doesn't halt the workflow — we branch on statusCode instead."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.statusCode}}",
+              "rightValue": 200,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8e011bf1-6ed1-4419-93e1-747d9bace8ce",
+      "name": "Direct PDF Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -512,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "return { json: { status: 'no_rate_published_today', note: 'No PDF found via direct URL or archive page fallback for ' + $('Build Date Info').item.json.todayLabel } };"
+      },
+      "id": "cd144cb6-811c-427d-84a1-b275959226ed",
+      "name": "No Rate Published Today",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -288,
+        496
+      ],
+      "notes": "End state for weekends/holidays or unexpected site changes. Wire this to a Slack/email alert node if you want visibility into repeated failures vs. expected no-publish days."
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "options": {}
+      },
+      "id": "36c9d96a-28ef-4681-b789-7d5ca4783002",
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        -288,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const text = $json.text || '';\nconst dateInfo = $('Build Date Info').item.json;\n\nconst lines = text.split('\\n').map(l => l.trim()).filter(Boolean);\n\nconst rowPattern = /^([A-Z]{2,5}(?:\\/[A-Z]{2,5})?)\\s*(\\*)?\\s+([\\d,]+\\.?\\d*)\\s+([\\d,]+\\.?\\d*)\\s+([\\d,]+\\.?\\d*)\\s+([\\d,]+\\.?\\d*)\\s+([\\d,]+\\.?\\d*)\\s+([\\d,]+\\.?\\d*)\\s*$/;\n\nconst num = (s) => parseFloat(s.replace(/,/g, ''));\n\nconst results = [];\nfor (const line of lines) {\n  const m = line.match(rowPattern);\n  if (m) {\n    results.push({\n      json: {\n        rate_date: `${dateInfo.year}-${String(new Date(`${dateInfo.monthTitle} ${dateInfo.day}, ${dateInfo.year}`).getMonth() + 1).padStart(2, '0')}-${String(dateInfo.day).padStart(2, '0')}`,\n        currency: m[1],\n        indicative: !!m[2],\n        indices_bid: num(m[3]),\n        indices_ask: num(m[4]),\n        indices_mid: num(m[5]),\n        rate_bid_zwg: num(m[6]),\n        rate_ask_zwg: num(m[7]),\n        rate_mid_zwg: num(m[8])\n      }\n    });\n  }\n}\n\nreturn results;"
+      },
+      "id": "fee98390-435e-4447-9d60-3dcd7692b4bb",
+      "name": "Parse Rate Table",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        304
+      ],
+      "notes": "Placeholder parsing logic. Confirm against a real extracted PDF text sample before relying on this."
+    },
+    {
+      "parameters": {
+        "table": "rbz_exchange_rates",
+        "columns": "rate_date, currency, indicative, indices_bid, indices_ask, indices_mid, rate_bid_zwg, rate_ask_zwg, rate_mid_zwg, source_url"
+      },
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.1,
+      "position": [
+        160,
+        304
+      ],
+      "id": "8181933c-5536-4fb9-ae42-b2aeb34ca9d8",
+      "name": "Microsoft SQL",
+      "credentials": {
+        "microsoftSql": {
+          "id": "xx1GTXO6Bc9ujI6o",
+          "name": "Microsoft SQL account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Daily Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Date Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Date Info": {
+      "main": [
+        [
+          {
+            "node": "Try Direct PDF URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Try Direct PDF URL": {
+      "main": [
+        [
+          {
+            "node": "Direct PDF Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Direct PDF Found?": {
+      "main": [
+        [
+          {
+            "node": "Extract PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Rate Published Today",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Parse Rate Table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Rate Table": {
+      "main": [
+        [
+          {
+            "node": "Microsoft SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "22bc20e0-574d-49f6-b17f-a62dd905c8fd",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "53a80284a1c2cf86ca935a64a8ec6e00c5f9c49f44735a6a855be1de1b3b7a40"
+  },
+  "nodeGroups": [],
+  "id": "wKvcfwDFuay6iKOa",
+  "tags": []
+}
